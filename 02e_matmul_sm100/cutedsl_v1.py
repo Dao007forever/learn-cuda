@@ -11,125 +11,15 @@ from functools import cache
 import cutlass
 import torch
 from cuda.bindings.driver import CUstream
-from cutlass import BFloat16, Boolean, Float32, Int32, Int64, Uint32, Uint64, cute
-from cutlass._mlir import ir
-from cutlass._mlir.dialects import llvm, nvvm
+from cute_utils import _fp32x2_to_bf16x2, _stg_vec, tcgen05_dealloc, tcgen05_ld, tcgen05_mma_f16
+from cutlass import BFloat16, Int32, Int64, Uint32, cute
+from cutlass._mlir.dialects import nvvm
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.utils import get_smem_capacity_in_bytes
 from triton.testing import do_bench
 
 
-@dsl_user_op
-def tcgen05_mma_f16(
-    d_tmem,
-    a_desc,
-    b_desc,
-    idesc: cutlass.Constexpr,
-    enable_input_d,
-    *,
-    loc=None,
-    ip=None,
-) -> None:
-    nvvm.tcgen05_mma(
-        nvvm.Tcgen05MMAKind.F16,
-        nvvm.Tcgen05GroupKind.CTA_1,
-        llvm.inttoptr(
-            llvm.PointerType.get(cute.AddressSpace.tmem.value),
-            Int32(d_tmem).ir_value(loc=loc, ip=ip),
-            loc=loc,
-            ip=ip,
-        ),
-        Uint64(a_desc).ir_value(loc=loc, ip=ip),
-        Uint64(b_desc).ir_value(loc=loc, ip=ip),
-        Int32(idesc & 0xFFFF_FFFF).ir_value(loc=loc, ip=ip),
-        Boolean(enable_input_d).ir_value(loc=loc, ip=ip),
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def tcgen05_ld(taddr, shape, num, *, loc=None, ip=None):
-    if shape == nvvm.Tcgen05LdStShape.SHAPE_32X32B:
-        num_regs = num
-    elif shape == nvvm.Tcgen05LdStShape.SHAPE_16X128B:
-        num_regs = num * 2
-    elif shape == nvvm.Tcgen05LdStShape.SHAPE_16X256B:
-        num_regs = num * 4
-    else:
-        raise ValueError
-
-    tmem_ptr_ty = llvm.PointerType.get(cute.AddressSpace.tmem.value)
-    tmem_ptr = llvm.inttoptr(tmem_ptr_ty, Int32(taddr).ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
-
-    if num_regs == 1:
-        reg = nvvm.tcgen05_ld(Int32.mlir_type, shape, num, tmem_ptr, loc=loc, ip=ip)
-        reg_f32 = llvm.bitcast(Float32.mlir_type, reg, loc=loc, ip=ip)
-        return Float32(reg_f32)
-
-    else:
-        vec_i32_ty = ir.VectorType.get([num_regs], Int32.mlir_type, loc=loc)
-        vec_f32_ty = ir.VectorType.get([num_regs], Float32.mlir_type, loc=loc)
-        regs = nvvm.tcgen05_ld(vec_i32_ty, shape, num, tmem_ptr, loc=loc, ip=ip)
-        regs_f32 = llvm.bitcast(vec_f32_ty, regs, loc=loc, ip=ip)
-        return cute.TensorSSA(regs_f32, (num_regs,), Float32)
-
-
-@dsl_user_op
-def tcgen05_dealloc(*, loc=None, ip=None) -> None:
-    tmem_ptr_ty = llvm.PointerType.get(cute.AddressSpace.tmem.value)
-    nvvm.tcgen05_dealloc(
-        llvm.inttoptr(tmem_ptr_ty, Int32(0).ir_value(loc=loc, ip=ip), loc=loc, ip=ip),
-        Int32(512).ir_value(loc=loc, ip=ip),
-        group=nvvm.Tcgen05GroupKind.CTA_1,
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def _fp32x2_to_bf16x2(a: Float32, b: Float32, *, loc=None, ip=None) -> Uint32:
-    return Uint32(
-        llvm.inline_asm(
-            T.i32(),
-            [
-                Float32(a).ir_value(loc=loc, ip=ip),
-                Float32(b).ir_value(loc=loc, ip=ip),
-            ],
-            "cvt.rn.bf16x2.f32 $0, $2, $1;",
-            "=r,f,f",
-            has_side_effects=False,
-            is_align_stack=False,
-        )
-    )
-
-
-@dsl_user_op
-def _stg_u32xN(
-    tensor: cute.Tensor,
-    coord: cute.Coord,
-    values: cute.Tensor,
-    vec_size: cutlass.Constexpr[int],
-    modifier: cutlass.Constexpr[str] = "",
-    *,
-    loc=None,
-    ip=None,
-) -> None:
-    base_ptr = (tensor.iterator + cute.crd2idx(coord, tensor.layout, loc=loc, ip=ip)).toint()
-    value_operands = ", ".join(f"${i + 1}" for i in range(vec_size))
-    llvm.inline_asm(
-        None,
-        [Int64(base_ptr).ir_value(loc=loc, ip=ip)]
-        + [Uint32(values[i]).ir_value(loc=loc, ip=ip) for i in range(vec_size)],
-        f"st.global{modifier}.v{vec_size}.u32 [$0], {{{value_operands}}};",
-        ",".join(["l"] + ["r"] * vec_size),
-        has_side_effects=True,
-        is_align_stack=False,
-    )
-
-
-class MatmulKernel:
+class MatmulV1Kernel:
     def __init__(self, BN: int = 128):
         BM = 128
         BK = 64
@@ -157,12 +47,12 @@ class MatmulKernel:
         A_args = self.prepare_AB(A, BM, BK)
         B_args = self.prepare_AB(B, BN, BK)
 
-        M, K = A.shape
+        M, _ = A.shape
         N, _ = B.shape
         grid_m = cute.ceil_div(M, BM)
         grid_n = cute.ceil_div(N, BN)
         self.kernel(A_args, B_args, C).launch(
-            grid=(grid_m, grid_n),
+            grid=(grid_m, grid_n, 1),
             block=(6 * 32, 1, 1),
             stream=stream,
         )
@@ -193,24 +83,6 @@ class MatmulKernel:
 
         M, K = A_tma_tensor.shape
 
-        # select gmem tile
-        gA_tile = cute.local_tile(A_tma_tensor, (BM, BK), (bid_m, None))  # [BM, BK, K/BK]
-        gB_tile = cute.local_tile(B_tma_tensor, (BN, BK), (bid_n, None))  # [BM, BK, K/BK]
-        tAsA, tAgA = cpasync.tma_partition(
-            A_tma_atom,
-            0,
-            cute.make_layout(1),
-            cute.group_modes(sA, 0, 2),
-            cute.group_modes(gA_tile, 0, 2),
-        )
-        tBsB, tBgB = cpasync.tma_partition(
-            B_tma_atom,
-            0,
-            cute.make_layout(1),
-            cute.group_modes(sB, 0, 2),
-            cute.group_modes(gB_tile, 0, 2),
-        )
-
         if warp_id == 0:
             for i in cutlass.range_constexpr(self.num_stages):
                 cute.arch.mbarrier_init(tma_full_mbar + i, 1)
@@ -223,6 +95,24 @@ class MatmulKernel:
 
         # TMA warp
         if warp_id == 5:
+            # select gmem tile
+            gA_tile = cute.local_tile(A_tma_tensor, (BM, BK), (bid_m, None))  # [BM, BK, K/BK]
+            gB_tile = cute.local_tile(B_tma_tensor, (BN, BK), (bid_n, None))  # [BM, BK, K/BK]
+            tAsA, tAgA = cpasync.tma_partition(
+                A_tma_atom,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sA, 0, 2),
+                cute.group_modes(gA_tile, 0, 2),
+            )
+            tBsB, tBgB = cpasync.tma_partition(
+                B_tma_atom,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sB, 0, 2),
+                cute.group_modes(gB_tile, 0, 2),
+            )
+
             tma_stage = 0
             empty_phase = 1
 
@@ -293,7 +183,7 @@ class MatmulKernel:
                         tmp[k] = _fp32x2_to_bf16x2(regs[j * 16 + k * 2], regs[j * 16 + k * 2 + 1])
 
                     coord = (bid_m * BM + tid, bid_n * BN + i * WIDTH + j * 16)
-                    _stg_u32xN(C_tensor, coord, tmp, 8, ".relaxed.cta.L1::no_allocate")
+                    _stg_vec(C_tensor, coord, tmp, 8, ".relaxed.cta.L1::no_allocate")
 
             cute.arch.barrier(barrier_id=1, number_of_threads=128)
             if warp_id == 0:
@@ -309,13 +199,13 @@ class MatmulKernel:
         B = cute.runtime.make_fake_tensor(BFloat16, (N, K), (K, 1), assumed_align=8)
         C = cute.runtime.make_fake_tensor(BFloat16, (M, N), (N, 1), assumed_align=16)
         stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-        kernel = MatmulKernel(BN)
+        kernel = MatmulV1Kernel(BN)
         return cute.compile(kernel, A, B, C, stream, options="--enable-tvm-ffi")
 
 
 def cutedsl_v1(A: torch.Tensor, B: torch.Tensor):
     C = A.new_empty(A.shape[0], B.shape[1])
-    MatmulKernel.compile(256)(A, B.T, C)
+    MatmulV1Kernel.compile(256)(A, B.T, C)
     return C
 
 
@@ -327,7 +217,7 @@ def main():
     C_ref = A @ B.T
 
     C = torch.empty(M, N, device="cuda", dtype=torch.bfloat16)
-    kernel = MatmulKernel.compile(256)
+    kernel = MatmulV1Kernel.compile(256)
     kernel(A, B, C)
     torch.cuda.synchronize()
 
