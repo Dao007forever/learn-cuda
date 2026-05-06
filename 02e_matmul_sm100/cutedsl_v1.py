@@ -88,6 +88,7 @@ class MatmulV1Kernel:
                 cute.arch.mbarrier_init(tma_full_mbar + i, 1)
                 cute.arch.mbarrier_init(tma_empty_mbar + i, 1)
             cute.arch.mbarrier_init(tmem_full_mbar, 1)
+            cute.arch.mbarrier_init_fence()
         elif warp_id == 1:
             cpasync.prefetch_descriptor(A_tma_atom)
             cpasync.prefetch_descriptor(B_tma_atom)
@@ -97,7 +98,7 @@ class MatmulV1Kernel:
         if warp_id == 5:
             # select gmem tile
             gA_tile = cute.local_tile(A_tma_tensor, (BM, BK), (bid_m, None))  # [BM, BK, K/BK]
-            gB_tile = cute.local_tile(B_tma_tensor, (BN, BK), (bid_n, None))  # [BM, BK, K/BK]
+            gB_tile = cute.local_tile(B_tma_tensor, (BN, BK), (bid_n, None))  # [BN, BK, K/BK]
             tAsA, tAgA = cpasync.tma_partition(
                 A_tma_atom,
                 0,
@@ -171,19 +172,18 @@ class MatmulV1Kernel:
             cute.arch.barrier(barrier_id=1, number_of_threads=128)
             nvvm.tcgen05_fence(nvvm.Tcgen05FenceKind.AFTER_THREAD_SYNC)
 
-            WIDTH = cutlass.const_expr(min(BN, 128))
+            WIDTH = cutlass.const_expr(min(BN, 16))
             for i in cutlass.range_constexpr(BN // WIDTH):
                 tmem = ((warp_id * 32) << 16) | (i * WIDTH)
                 regs = tcgen05_ld(tmem, nvvm.Tcgen05LdStShape.SHAPE_32X32B, WIDTH)
                 nvvm.tcgen05_wait(nvvm.Tcgen05WaitKind.LOAD)
 
-                for j in cutlass.range_constexpr(WIDTH // 16):
-                    tmp = cute.make_rmem_tensor(8, Uint32)
-                    for k in cutlass.range_constexpr(8):
-                        tmp[k] = _fp32x2_to_bf16x2(regs[j * 16 + k * 2], regs[j * 16 + k * 2 + 1])
+                tmp = cute.make_rmem_tensor(8, Uint32)
+                for k in cutlass.range_constexpr(8):
+                    tmp[k] = _fp32x2_to_bf16x2(regs[k * 2], regs[k * 2 + 1])
 
-                    coord = (bid_m * BM + tid, bid_n * BN + i * WIDTH + j * 16)
-                    _stg_vec(C_tensor, coord, tmp, 8, ".relaxed.cta.L1::no_allocate")
+                coord = (bid_m * BM + tid, bid_n * BN + i * WIDTH)
+                _stg_vec(C_tensor, coord, tmp, 8, ".relaxed.cta.L1::no_allocate")
 
             cute.arch.barrier(barrier_id=1, number_of_threads=128)
             if warp_id == 0:
@@ -215,16 +215,12 @@ def main():
     B = torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
 
     C_ref = A @ B.T
-
-    C = torch.empty(M, N, device="cuda", dtype=torch.bfloat16)
-    kernel = MatmulV1Kernel.compile(256)
-    kernel(A, B, C)
+    C = cutedsl_v1(A, B.T)
     torch.cuda.synchronize()
-
     torch.testing.assert_close(C, C_ref)
 
     cublas_ms = do_bench(lambda: torch.mm(A, B.T))
-    ours_ms = do_bench(lambda: kernel(A, B, C))
+    ours_ms = do_bench(lambda: cutedsl_v1(A, B.T))
 
     cublas_tflops = 2 * M * N * K / (cublas_ms * 1e-3) * 1e-12
     ours_tflops = 2 * M * N * K / (ours_ms * 1e-3) * 1e-12

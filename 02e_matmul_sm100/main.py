@@ -32,6 +32,7 @@ MY_KERNELS = [
     "matmul_v7b",
     "matmul_v7c",
     # "cutedsl_v1",
+    # "cutedsl_v2",
 ]
 
 

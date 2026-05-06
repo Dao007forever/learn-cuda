@@ -1,0 +1,327 @@
+import os
+
+os.environ["CUTE_DSL_KEEP_PTX"] = "1"
+os.environ["CUTE_DSL_KEEP_CUBIN"] = "1"
+os.environ["CUTE_DSL_LINEINFO"] = "1"
+os.environ["CUTE_DSL_DUMP_DIR"] = "./cutedsl_dump"
+os.environ["CUTE_DSL_NO_CACHE"] = "1"
+
+from functools import cache
+
+import cutlass
+import torch
+from cuda.bindings.driver import CUstream
+from cute_utils import _fp32x2_to_bf16x2, _stg_vec, tcgen05_dealloc, tcgen05_ld, tcgen05_mma_f16
+from cutlass import BFloat16, Int32, Int64, Uint16, Uint32, cute
+from cutlass._mlir.dialects import nvvm
+from cutlass.cute.nvgpu import cpasync, tcgen05
+from cutlass.utils import get_smem_capacity_in_bytes
+from triton.testing import do_bench
+
+
+class MatmulV2Kernel:
+    def __init__(self, BN: int = 128, cta_group: int = 1):
+        BM = 128
+        BK = 64
+        self.cta_tile = (BM, BN, BK)
+        self.cta_group = cta_group
+
+        smem_bytes = get_smem_capacity_in_bytes()
+        self.stage_size = (BM + (BN // cta_group)) * BK * 2
+        self.num_stages = smem_bytes // self.stage_size
+
+    @cute.jit
+    def prepare_AB(self, A: cute.Tensor, BM: cutlass.Constexpr, BK: cutlass.Constexpr):
+        tma_op = cpasync.CopyBulkTensorTileG2SOp(
+            cta_group=tcgen05.CtaGroup.TWO if self.cta_group == 2 else tcgen05.CtaGroup.ONE
+        )
+        swizzle_128B = cute.make_swizzle(3, 4, 3)
+        # we must put num_stages as the last mode since tma_partition() uses the 1st mode
+        s_layout = cute.make_layout((BM, BK, self.num_stages), stride=(BK, 1, BM * BK))
+        s_layout = cute.make_composed_layout(swizzle_128B, 0, s_layout)
+
+        one_stage = cute.slice_(s_layout, (None, None, 0))
+        tma_atom, tma_tensor = cpasync.make_tiled_tma_atom(tma_op, A, one_stage, (BM, BK))
+        return tma_atom, tma_tensor, s_layout
+
+    @cute.jit
+    def __call__(self, A: cute.Tensor, B: cute.Tensor, C: cute.Tensor, stream: CUstream):
+        BM, BN, BK = self.cta_tile
+        A_args = self.prepare_AB(A, BM, BK)
+        B_args = self.prepare_AB(B, BN // self.cta_group, BK)
+        self.kernel(A_args, B_args, C).launch(
+            grid=(128, 1, 1),
+            block=(6 * 32, 1, 1),
+            cluster=(self.cta_group, 1, 1),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        A_args: tuple[cute.CopyAtom, cute.Tensor, cute.ComposedLayout],
+        B_args: tuple[cute.CopyAtom, cute.Tensor, cute.ComposedLayout],
+        C_tensor: cute.Tensor,
+    ):
+        tid, _, _ = cute.arch.thread_idx()
+        raw_bid, _, _ = cute.arch.block_idx()
+        num_bids, _, _ = cute.arch.grid_dim()
+        warp_id = cute.arch.make_warp_uniform(tid // 32)
+        cta_rank = raw_bid % self.cta_group
+        BM, BN, BK = self.cta_tile
+        cta_group = nvvm.Tcgen05GroupKind.CTA_2 if self.cta_group == 2 else nvvm.Tcgen05GroupKind.CTA_1
+
+        A_tma_atom, A_tma_tensor, sA_layout = A_args
+        B_tma_atom, B_tma_tensor, sB_layout = B_args
+
+        # allocate smem
+        smem = cutlass.utils.SmemAllocator()
+        sA = smem.allocate_tensor(BFloat16, sA_layout.outer, byte_alignment=128, swizzle=sA_layout.inner)
+        sB = smem.allocate_tensor(BFloat16, sB_layout.outer, byte_alignment=128, swizzle=sB_layout.inner)
+        tma_full_mbar = smem.allocate_array(Int64, self.num_stages)
+        tma_empty_mbar = smem.allocate_array(Int64, self.num_stages)
+        tmem_full_mbar = smem.allocate_array(Int64, 2)
+        tmem_empty_mbar = smem.allocate_array(Int64, 2)
+        taddr = smem.allocate(Int32, 4)
+
+        M, K = A_tma_tensor.shape
+        N, _ = B_tma_tensor.shape
+        grid_m = cute.ceil_div(M, BM)
+        grid_n = cute.ceil_div(N, BN)
+
+        if warp_id == 0:
+            for i in cutlass.range_constexpr(self.num_stages):
+                cute.arch.mbarrier_init(tma_full_mbar + i, self.cta_group)
+                cute.arch.mbarrier_init(tma_empty_mbar + i, 1)
+            for i in cutlass.range_constexpr(2):
+                cute.arch.mbarrier_init(tmem_full_mbar + i, 1)
+                cute.arch.mbarrier_init(tmem_empty_mbar + i, 128 * self.cta_group)
+            cute.arch.mbarrier_init_fence()
+        elif warp_id == 1:
+            cpasync.prefetch_descriptor(A_tma_atom)
+            cpasync.prefetch_descriptor(B_tma_atom)
+
+        if cutlass.const_expr(self.cta_group == 2):
+            cute.arch.cluster_arrive_relaxed()
+            cute.arch.cluster_wait()
+        else:
+            cute.arch.sync_threads()
+
+        # TMA warp
+        if warp_id == 5:
+            tma_stage = 0
+            tma_empty_phase = 1
+
+            if cutlass.const_expr(self.cta_group == 2):
+                tma_full_mbar_ = cute.make_ptr(
+                    Int64,
+                    tma_full_mbar.toint() & 0xFEFF_FFFF,
+                    cute.AddressSpace.smem,
+                    assumed_align=8,
+                )
+            else:
+                tma_full_mbar_ = tma_full_mbar
+
+            for bid in range(raw_bid, grid_m * grid_n, num_bids):
+                bid_m = bid // (grid_n * 2) * 2 + bid % 2
+                bid_n = (bid // 2) % grid_n
+
+                # select gmem tile
+                gA_tile = cute.local_tile(A_tma_tensor, (BM, BK), (bid_m, None))  # [BM, BK, K/BK]
+                gB_tile = cute.local_tile(
+                    B_tma_tensor,
+                    (BN // self.cta_group, BK),
+                    (bid_n * self.cta_group + cta_rank, None),
+                )  # [BN, BK, K/BK]
+                tAsA, tAgA = cpasync.tma_partition(
+                    A_tma_atom,
+                    0,
+                    cute.make_layout(1),
+                    cute.group_modes(sA, 0, 2),
+                    cute.group_modes(gA_tile, 0, 2),
+                )
+                tBsB, tBgB = cpasync.tma_partition(
+                    B_tma_atom,
+                    0,
+                    cute.make_layout(1),
+                    cute.group_modes(sB, 0, 2),
+                    cute.group_modes(gB_tile, 0, 2),
+                )
+
+                for iter_k in cutlass.range(cute.ceil_div(K, BK), unroll=1):
+                    cute.arch.mbarrier_wait(tma_empty_mbar + tma_stage, tma_empty_phase)
+
+                    mbar = tma_full_mbar_ + tma_stage
+                    with cute.arch.elect_one():
+                        nvvm.mbarrier_txn(
+                            mbar.to_llvm_ptr(),
+                            Int32(self.stage_size).ir_value(),
+                            kind=nvvm.MBarrierTxnKind.ARRIVE_EXPECT_TX,
+                            space=nvvm.MBarrierSpaceKind.CLUSTER,
+                            order=nvvm.MemOrderKind.RELAXED,
+                        )
+                    cute.copy(A_tma_atom, tAgA[None, iter_k], tAsA[None, tma_stage], tma_bar_ptr=mbar)
+                    cute.copy(B_tma_atom, tBgB[None, iter_k], tBsB[None, tma_stage], tma_bar_ptr=mbar)
+
+                    tma_stage = (tma_stage + 1) % self.num_stages
+                    if tma_stage == 0:
+                        tma_empty_phase ^= 1
+
+        # MMA warp
+        elif warp_id == 4:
+            nvvm.tcgen05_alloc(taddr.to_llvm_ptr(), Uint32(512).ir_value(), group=cta_group)
+
+            if cta_rank == 0:
+                tma_stage = 0
+                tma_full_phase = 0
+                tmem_stage = 0
+                tmem_empty_phase = 1
+
+                # BF16 MMA
+                MMA_M = BM * self.cta_group
+                MMA_N = BN
+                idesc = cutlass.const_expr((1 << 4) | (1 << 7) | (1 << 10) | (MMA_N >> 3 << 17) | (MMA_M >> 4 << 24))
+                # 128B swizzling
+                sdesc = cutlass.const_expr(((8 * 128) >> 4 << 32) | (1 << 46) | (2 << 61))
+                multicast_mask = Uint16((1 << self.cta_group) - 1)
+
+                for bid in range(raw_bid, grid_m * grid_n, num_bids):
+                    cute.arch.mbarrier_wait(tmem_empty_mbar + tmem_stage, tmem_empty_phase)
+                    nvvm.tcgen05_fence(nvvm.Tcgen05FenceKind.AFTER_THREAD_SYNC)
+
+                    for iter_k in cutlass.range(cute.ceil_div(K, BK), unroll=1):
+                        cute.arch.mbarrier_wait(tma_full_mbar + tma_stage, tma_full_phase)
+                        nvvm.tcgen05_fence(nvvm.Tcgen05FenceKind.AFTER_THREAD_SYNC)
+
+                        d_tmem = BN * tmem_stage
+                        a_desc = sdesc | (sA[None, None, tma_stage].iterator.toint() >> 4)
+                        b_desc = sdesc | (sB[None, None, tma_stage].iterator.toint() >> 4)
+
+                        MMA_K = cutlass.const_expr(16)  # 32B
+
+                        with cute.arch.elect_one():
+                            for k in cutlass.range_constexpr(BK // MMA_K):
+                                tcgen05_mma_f16(d_tmem, a_desc, b_desc, idesc, iter_k > 0 or k > 0, cta_group)
+                                a_desc += 32 >> 4
+                                b_desc += 32 >> 4
+                            nvvm.tcgen05_commit_arrive(
+                                (tma_empty_mbar + tma_stage).to_llvm_ptr(),
+                                multicast_mask=multicast_mask.ir_value(),
+                                group=cta_group,
+                            )
+
+                        tma_stage = (tma_stage + 1) % self.num_stages
+                        if tma_stage == 0:
+                            tma_full_phase ^= 1
+
+                    with cute.arch.elect_one():
+                        nvvm.tcgen05_commit_arrive(
+                            (tmem_full_mbar + tmem_stage).to_llvm_ptr(),
+                            multicast_mask=multicast_mask.ir_value(),
+                            group=cta_group,
+                        )
+
+                    tmem_stage = (tmem_stage + 1) % 2
+                    if tmem_stage == 0:
+                        tmem_empty_phase ^= 1
+
+        # epilogue warps
+        else:
+            tmem_stage = 0
+            tmem_full_phase = 0
+
+            if cutlass.const_expr(self.cta_group == 2):
+                tmem_empty_mbar_ = cute.make_ptr(
+                    Int64,
+                    tmem_empty_mbar.toint() & 0xFEFF_FFFF,
+                    cute.AddressSpace.smem,
+                    assumed_align=8,
+                )
+            else:
+                tmem_empty_mbar_ = tmem_empty_mbar
+
+            for bid in range(raw_bid, grid_m * grid_n, num_bids):
+                bid_m = bid // (grid_n * 2) * 2 + bid % 2
+                bid_n = (bid // 2) % grid_n
+
+                if warp_id == 0:
+                    cute.arch.mbarrier_wait(tmem_full_mbar + tmem_stage, tmem_full_phase)
+                cute.arch.barrier(barrier_id=1, number_of_threads=128)
+                nvvm.tcgen05_fence(nvvm.Tcgen05FenceKind.AFTER_THREAD_SYNC)
+
+                WIDTH = cutlass.const_expr(min(BN, 16))
+                for i in cutlass.range_constexpr(BN // WIDTH):
+                    d_tmem = ((warp_id * 32) << 16) | (tmem_stage * BN + i * WIDTH)
+                    regs = tcgen05_ld(d_tmem, nvvm.Tcgen05LdStShape.SHAPE_32X32B, WIDTH)
+                    nvvm.tcgen05_wait(nvvm.Tcgen05WaitKind.LOAD)
+
+                    if cutlass.const_expr(i == BN // WIDTH - 1):
+                        nvvm.tcgen05_fence(nvvm.Tcgen05FenceKind.BEFORE_THREAD_SYNC)
+                        nvvm.mbarrier_txn(
+                            (tmem_empty_mbar_ + tmem_stage).to_llvm_ptr(),
+                            Uint32(1).ir_value(),
+                            kind=nvvm.MBarrierTxnKind.ARRIVE,
+                            space=nvvm.MBarrierSpaceKind.CLUSTER,
+                            order=nvvm.MemOrderKind.RELAXED,
+                        )
+
+                    tmp = cute.make_rmem_tensor(8, Uint32)
+                    for k in cutlass.range_constexpr(8):
+                        tmp[k] = _fp32x2_to_bf16x2(regs[k * 2], regs[k * 2 + 1])
+
+                    coord = (bid_m * BM + tid, bid_n * BN + i * WIDTH)
+                    _stg_vec(C_tensor, coord, tmp, 8, ".relaxed.cta.L1::no_allocate")
+
+                tmem_stage = (tmem_stage + 1) % 2
+                if tmem_stage == 0:
+                    tmem_full_phase ^= 1
+
+            if cutlass.const_expr(self.cta_group == 2):
+                cute.arch.cluster_arrive_relaxed()
+                cute.arch.cluster_wait()
+            else:
+                cute.arch.barrier(barrier_id=1, number_of_threads=128)
+            if warp_id == 0:
+                tcgen05_dealloc(cta_group)
+
+    @cache
+    @staticmethod
+    def compile(BN: int = 128, cta_group: int = 2):
+        M = cute.sym_int()
+        N = cute.sym_int()
+        K = cute.sym_int()
+        A = cute.runtime.make_fake_tensor(BFloat16, (M, K), (K, 1), assumed_align=8)
+        B = cute.runtime.make_fake_tensor(BFloat16, (N, K), (K, 1), assumed_align=8)
+        C = cute.runtime.make_fake_tensor(BFloat16, (M, N), (N, 1), assumed_align=16)
+        stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        kernel = MatmulV2Kernel(BN, cta_group)
+        return cute.compile(kernel, A, B, C, stream, options="--enable-tvm-ffi")
+
+
+def cutedsl_v2(A: torch.Tensor, B: torch.Tensor):
+    C = A.new_empty(A.shape[0], B.shape[1])
+    MatmulV2Kernel.compile(256, 2)(A, B.T, C)
+    return C
+
+
+def main():
+    M, N, K = 4096, 4096, 4096
+    A = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    B = torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
+
+    C_ref = A @ B.T
+    C = cutedsl_v2(A, B.T)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(C, C_ref)
+
+    cublas_ms = do_bench(lambda: torch.mm(A, B.T))
+    ours_ms = do_bench(lambda: cutedsl_v2(A, B.T))
+
+    cublas_tflops = 2 * M * N * K / (cublas_ms * 1e-3) * 1e-12
+    ours_tflops = 2 * M * N * K / (ours_ms * 1e-3) * 1e-12
+    print(f"{cublas_tflops=}")
+    print(f"{ours_tflops=}")
+
+
+if __name__ == "__main__":
+    main()
