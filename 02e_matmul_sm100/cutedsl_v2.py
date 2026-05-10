@@ -11,7 +11,7 @@ from functools import cache
 import cutlass
 import torch
 from cuda.bindings.driver import CUstream
-from cute_utils import _fp32x2_to_bf16x2, _stg_vec, tcgen05_dealloc, tcgen05_ld, tcgen05_mma_f16
+from cute_utils import _fp32x2_to_bf16x2, tcgen05_dealloc, tcgen05_ld, tcgen05_mma_f16
 from cutlass import BFloat16, Int32, Int64, Uint16, Uint32, cute
 from cutlass._mlir.dialects import nvvm
 from cutlass.cute.nvgpu import cpasync, tcgen05
@@ -227,6 +227,17 @@ class MatmulV2Kernel:
 
         # epilogue warps
         else:
+            # (M, (WIDTH, N/WIDTH))
+            WIDTH = cutlass.const_expr(16)
+            C_ = cute.logical_divide(C_tensor, tiler=(None, WIDTH))
+
+            u32x8_atom = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(),
+                Uint32,
+                num_bits_per_copy=256,
+                l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
+            )
+
             tmem_stage = 0
             tmem_full_phase = 0
 
@@ -249,7 +260,6 @@ class MatmulV2Kernel:
                 cute.arch.barrier(barrier_id=1, number_of_threads=128)
                 nvvm.tcgen05_fence(nvvm.Tcgen05FenceKind.AFTER_THREAD_SYNC)
 
-                WIDTH = cutlass.const_expr(min(BN, 16))
                 for i in cutlass.range_constexpr(BN // WIDTH):
                     d_tmem = ((warp_id * 32) << 16) | (tmem_stage * BN + i * WIDTH)
                     regs = tcgen05_ld(d_tmem, nvvm.Tcgen05LdStShape.SHAPE_32X32B, WIDTH)
@@ -269,8 +279,9 @@ class MatmulV2Kernel:
                     for k in cutlass.range_constexpr(8):
                         tmp[k] = _fp32x2_to_bf16x2(regs[k * 2], regs[k * 2 + 1])
 
-                    coord = (bid_m * BM + tid, bid_n * BN + i * WIDTH)
-                    _stg_vec(C_tensor, coord, tmp, 8, ".relaxed.cta.L1::no_allocate")
+                    # C_ shape: (M, (WIDTH, N/WIDTH))
+                    dst = C_[bid_m * BM + tid, (None, bid_n * (BN // WIDTH) + i)]
+                    cute.copy(u32x8_atom, tmp, cute.recast_tensor(dst, Uint32))
 
                 tmem_stage = (tmem_stage + 1) % 2
                 if tmem_stage == 0:
@@ -292,7 +303,7 @@ class MatmulV2Kernel:
         K = cute.sym_int()
         A = cute.runtime.make_fake_tensor(BFloat16, (M, K), (K, 1), assumed_align=8)
         B = cute.runtime.make_fake_tensor(BFloat16, (N, K), (K, 1), assumed_align=8)
-        C = cute.runtime.make_fake_tensor(BFloat16, (M, N), (N, 1), assumed_align=16)
+        C = cute.runtime.make_fake_tensor(BFloat16, (M, N), (cute.sym_int(divisibility=16), 1), assumed_align=32)
         stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         kernel = MatmulV2Kernel(BN, cta_group)
         return cute.compile(kernel, A, B, C, stream, options="--enable-tvm-ffi")

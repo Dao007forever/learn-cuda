@@ -1,5 +1,4 @@
-import cutlass
-from cutlass import Boolean, Float32, Int32, Int64, Uint32, Uint64, cute
+from cutlass import Boolean, Float32, Int32, Uint32, Uint64, cute
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm, nvvm
 from cutlass.cutlass_dsl import T, dsl_user_op
@@ -90,36 +89,3 @@ def _fp32x2_to_bf16x2(a: Float32, b: Float32, *, loc=None, ip=None) -> Uint32:
         is_align_stack=False,
     )
     return Uint32(out)
-
-
-@dsl_user_op
-def _stg_vec(
-    tensor: cute.Tensor,
-    coord: cute.Coord,
-    values: cute.Tensor,
-    vec_size: cutlass.Constexpr[int],
-    modifier: cutlass.Constexpr[str] = "",
-    *,
-    loc=None,
-    ip=None,
-) -> None:
-    st_type = values.element_type
-    if st_type is Uint32:
-        ptx_ty = "u32"
-        constraint = "r"
-    elif st_type is Float32:
-        ptx_ty = "f32"
-        constraint = "f"
-    else:
-        raise ValueError(f"_stg_vec() only supports Uint32 and Float32, received {st_type}")
-
-    base_ptr = (tensor.iterator + cute.crd2idx(coord, tensor.layout, loc=loc, ip=ip)).toint()
-    value_operands = ", ".join(f"${i + 1}" for i in range(vec_size))
-    llvm.inline_asm(
-        None,
-        [Int64(base_ptr).ir_value(loc=loc, ip=ip)] + [values[i].ir_value(loc=loc, ip=ip) for i in range(vec_size)],
-        f"st.global{modifier}.v{vec_size}.{ptx_ty} [$0], {{{value_operands}}};",
-        ",".join(["l"] + [constraint] * vec_size),
-        has_side_effects=True,
-        is_align_stack=False,
-    )
