@@ -216,7 +216,14 @@ if __name__ == "__main__":
             modal.Image.from_registry("nvidia/cuda:13.0.2-cudnn-devel-ubuntu24.04", add_python="3.12")
             .entrypoint([])  # remove verbose logging by base image on entry
             .uv_pip_install("torch==2.11.0")
-            .uv_pip_install("ninja", "pandas", "tabulate", "nvidia-cutlass-dsl", "apache-tvm-ffi", "cuda-bench[cu13]")
+            .uv_pip_install(
+                "ninja",
+                "pandas",
+                "tabulate",
+                "nvidia-cutlass-dsl[cu13]>=4.5.0",
+                "apache-tvm-ffi",
+                "cuda-bench[cu13]",
+            )
             .workdir("/workspace")
             .add_local_dir(CURRENT_DIR, remote_path="/workspace", ignore=["*.venv"])
         )

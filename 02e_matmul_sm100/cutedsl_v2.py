@@ -3,7 +3,7 @@ import os
 os.environ["CUTE_DSL_KEEP_PTX"] = "1"
 os.environ["CUTE_DSL_KEEP_CUBIN"] = "1"
 os.environ["CUTE_DSL_LINEINFO"] = "1"
-os.environ["CUTE_DSL_DUMP_DIR"] = "./cutedsl_dump"
+os.environ["CUTE_DSL_DUMP_DIR"] = "./cutedsl_dump_nvvm"
 os.environ["CUTE_DSL_NO_CACHE"] = "1"
 
 from functools import cache
@@ -11,11 +11,11 @@ from functools import cache
 import cutlass
 import torch
 from cuda.bindings.driver import CUstream
-from cute_utils import _fp32x2_to_bf16x2, tcgen05_dealloc, tcgen05_ld, tcgen05_mma_f16
+from cute_utils import _tcgen05
 from cutlass import BFloat16, Int32, Int64, Uint16, Uint32, cute
 from cutlass._mlir.dialects import nvvm
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.utils import get_smem_capacity_in_bytes
+from cutlass.utils import block_copy, get_smem_capacity_in_bytes
 from triton.testing import do_bench
 
 
@@ -68,8 +68,9 @@ class MatmulV2Kernel:
         num_bids, _, _ = cute.arch.grid_dim()
         warp_id = cute.arch.make_warp_uniform(tid // 32)
         cta_rank = raw_bid % self.cta_group
+
         BM, BN, BK = self.cta_tile
-        cta_group = nvvm.Tcgen05GroupKind.CTA_2 if self.cta_group == 2 else nvvm.Tcgen05GroupKind.CTA_1
+        cta_group = self.cta_group
 
         A_tma_atom, A_tma_tensor, sA_layout = A_args
         B_tma_atom, B_tma_tensor, sB_layout = B_args
@@ -133,20 +134,12 @@ class MatmulV2Kernel:
                     (BN // self.cta_group, BK),
                     (bid_n * self.cta_group + cta_rank, None),
                 )  # [BN, BK, K/BK]
-                tAsA, tAgA = cpasync.tma_partition(
-                    A_tma_atom,
-                    0,
-                    cute.make_layout(1),
-                    cute.group_modes(sA, 0, 2),
-                    cute.group_modes(gA_tile, 0, 2),
-                )
-                tBsB, tBgB = cpasync.tma_partition(
-                    B_tma_atom,
-                    0,
-                    cute.make_layout(1),
-                    cute.group_modes(sB, 0, 2),
-                    cute.group_modes(gB_tile, 0, 2),
-                )
+
+                # cute.copy() / block_copy() requires 1st mode to cover the whole TMA tile
+                gA_ = cute.group_modes(gA_tile, 0, 2)  # [(BM, BK), K/BK]
+                gB_ = cute.group_modes(gB_tile, 0, 2)  # [(BN, BK), K/BK]
+                sA_ = cute.group_modes(sA, 0, 2)  # [(BM, BK), num_stages]
+                sB_ = cute.group_modes(sB, 0, 2)  # [(BN, BK), num_stages]
 
                 for iter_k in cutlass.range(cute.ceil_div(K, BK), unroll=1):
                     cute.arch.mbarrier_wait(tma_empty_mbar + tma_stage, tma_empty_phase)
@@ -160,8 +153,8 @@ class MatmulV2Kernel:
                             space=nvvm.MBarrierSpaceKind.CLUSTER,
                             order=nvvm.MemOrderKind.RELAXED,
                         )
-                    cute.copy(A_tma_atom, tAgA[None, iter_k], tAsA[None, tma_stage], tma_bar_ptr=mbar)
-                    cute.copy(B_tma_atom, tBgB[None, iter_k], tBsB[None, tma_stage], tma_bar_ptr=mbar)
+                    block_copy(A_tma_atom, gA_[None, iter_k], sA_[None, tma_stage], tma_bar_ptr=mbar)
+                    block_copy(B_tma_atom, gB_[None, iter_k], sB_[None, tma_stage], tma_bar_ptr=mbar)
 
                     tma_stage = (tma_stage + 1) % self.num_stages
                     if tma_stage == 0:
@@ -169,7 +162,7 @@ class MatmulV2Kernel:
 
         # MMA warp
         elif warp_id == 4:
-            nvvm.tcgen05_alloc(taddr.to_llvm_ptr(), Uint32(512).ir_value(), group=cta_group)
+            _tcgen05.alloc(taddr)
 
             if cta_rank == 0:
                 tma_stage = 0
@@ -187,11 +180,11 @@ class MatmulV2Kernel:
 
                 for bid in range(raw_bid, grid_m * grid_n, num_bids):
                     cute.arch.mbarrier_wait(tmem_empty_mbar + tmem_stage, tmem_empty_phase)
-                    nvvm.tcgen05_fence(nvvm.Tcgen05FenceKind.AFTER_THREAD_SYNC)
+                    _tcgen05.fence_after_thread_sync()
 
                     for iter_k in cutlass.range(cute.ceil_div(K, BK), unroll=1):
                         cute.arch.mbarrier_wait(tma_full_mbar + tma_stage, tma_full_phase)
-                        nvvm.tcgen05_fence(nvvm.Tcgen05FenceKind.AFTER_THREAD_SYNC)
+                        _tcgen05.fence_after_thread_sync()
 
                         d_tmem = BN * tmem_stage
                         a_desc = sdesc | (sA[None, None, tma_stage].iterator.toint() >> 4)
@@ -201,25 +194,17 @@ class MatmulV2Kernel:
 
                         with cute.arch.elect_one():
                             for k in cutlass.range_constexpr(BK // MMA_K):
-                                tcgen05_mma_f16(d_tmem, a_desc, b_desc, idesc, iter_k > 0 or k > 0, cta_group)
+                                _tcgen05.mma_f16(d_tmem, a_desc, b_desc, idesc, iter_k > 0 or k > 0, cta_group)
                                 a_desc += 32 >> 4
                                 b_desc += 32 >> 4
-                            nvvm.tcgen05_commit_arrive(
-                                (tma_empty_mbar + tma_stage).to_llvm_ptr(),
-                                multicast_mask=multicast_mask.ir_value(),
-                                group=cta_group,
-                            )
+                            _tcgen05.commit(tma_empty_mbar + tma_stage, multicast_mask, cta_group)
 
                         tma_stage = (tma_stage + 1) % self.num_stages
                         if tma_stage == 0:
                             tma_full_phase ^= 1
 
                     with cute.arch.elect_one():
-                        nvvm.tcgen05_commit_arrive(
-                            (tmem_full_mbar + tmem_stage).to_llvm_ptr(),
-                            multicast_mask=multicast_mask.ir_value(),
-                            group=cta_group,
-                        )
+                        _tcgen05.commit(tmem_full_mbar + tmem_stage, multicast_mask, cta_group)
 
                     tmem_stage = (tmem_stage + 1) % 2
                     if tmem_stage == 0:
@@ -231,9 +216,9 @@ class MatmulV2Kernel:
             WIDTH = cutlass.const_expr(16)
             C_ = cute.logical_divide(C_tensor, tiler=(None, WIDTH))
 
-            u32x8_atom = cute.make_copy_atom(
+            bf16x16_atom = cute.make_copy_atom(
                 cute.nvgpu.CopyUniversalOp(),
-                Uint32,
+                BFloat16,
                 num_bits_per_copy=256,
                 l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
             )
@@ -258,15 +243,15 @@ class MatmulV2Kernel:
                 if warp_id == 0:
                     cute.arch.mbarrier_wait(tmem_full_mbar + tmem_stage, tmem_full_phase)
                 cute.arch.barrier(barrier_id=1, number_of_threads=128)
-                nvvm.tcgen05_fence(nvvm.Tcgen05FenceKind.AFTER_THREAD_SYNC)
+                _tcgen05.fence_after_thread_sync()
 
                 for i in cutlass.range_constexpr(BN // WIDTH):
                     d_tmem = ((warp_id * 32) << 16) | (tmem_stage * BN + i * WIDTH)
-                    regs = tcgen05_ld(d_tmem, nvvm.Tcgen05LdStShape.SHAPE_32X32B, WIDTH)
+                    regs = _tcgen05.ld(d_tmem, "32x32b", WIDTH)
                     nvvm.tcgen05_wait(nvvm.Tcgen05WaitKind.LOAD)
 
                     if cutlass.const_expr(i == BN // WIDTH - 1):
-                        nvvm.tcgen05_fence(nvvm.Tcgen05FenceKind.BEFORE_THREAD_SYNC)
+                        _tcgen05.fence_before_thread_sync()
                         nvvm.mbarrier_txn(
                             (tmem_empty_mbar_ + tmem_stage).to_llvm_ptr(),
                             Uint32(1).ir_value(),
@@ -275,13 +260,12 @@ class MatmulV2Kernel:
                             order=nvvm.MemOrderKind.RELAXED,
                         )
 
-                    tmp = cute.make_rmem_tensor(8, Uint32)
-                    for k in cutlass.range_constexpr(8):
-                        tmp[k] = _fp32x2_to_bf16x2(regs[k * 2], regs[k * 2 + 1])
+                    tmp = cute.make_rmem_tensor(16, BFloat16)
+                    tmp.store(regs.to(BFloat16))
 
                     # C_ shape: (M, (WIDTH, N/WIDTH))
                     dst = C_[bid_m * BM + tid, (None, bid_n * (BN // WIDTH) + i)]
-                    cute.copy(u32x8_atom, tmp, cute.recast_tensor(dst, Uint32))
+                    cute.copy(bf16x16_atom, tmp, dst)
 
                 tmem_stage = (tmem_stage + 1) % 2
                 if tmem_stage == 0:
@@ -293,7 +277,7 @@ class MatmulV2Kernel:
             else:
                 cute.arch.barrier(barrier_id=1, number_of_threads=128)
             if warp_id == 0:
-                tcgen05_dealloc(cta_group)
+                _tcgen05.dealloc(cta_group)
 
     @cache
     @staticmethod
