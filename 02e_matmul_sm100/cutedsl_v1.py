@@ -12,7 +12,7 @@ import cutlass
 import torch
 from cuda.bindings.driver import CUstream
 from cute_utils import _tcgen05
-from cutlass import BFloat16, Int32, Int64, Uint32, cute
+from cutlass import BFloat16, Int32, Int64, cute
 from cutlass._mlir.dialects import nvvm
 from cutlass.cute.nvgpu import cpasync
 from cutlass.utils import block_copy, get_smem_capacity_in_bytes
@@ -33,12 +33,12 @@ class MatmulV1Kernel:
     def prepare_AB(self, A: cute.Tensor, BM: cutlass.Constexpr, BK: cutlass.Constexpr):
         tma_op = cpasync.CopyBulkTensorTileG2SOp()
         swizzle_128B = cute.make_swizzle(3, 4, 3)
-        # we must put num_stages as the last mode since tma_partition() uses the 1st mode
+        # we must put num_stages as the last mode since a lot of CuteDSL functions assume that
         s_layout = cute.make_layout((BM, BK, self.num_stages), stride=(BK, 1, BM * BK))
         s_layout = cute.make_composed_layout(swizzle_128B, 0, s_layout)
 
-        one_stage = cute.slice_(s_layout, (None, None, 0))
-        tma_atom, tma_tensor = cpasync.make_tiled_tma_atom(tma_op, A, one_stage, (BM, BK))
+        # don't need to select 1 stage of s_layout, make_tiled_tma_atom() does it internally
+        tma_atom, tma_tensor = cpasync.make_tiled_tma_atom(tma_op, A, s_layout, (BM, BK))
         return tma_atom, tma_tensor, s_layout
 
     @cute.jit

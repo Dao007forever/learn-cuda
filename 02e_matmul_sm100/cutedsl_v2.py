@@ -36,12 +36,10 @@ class MatmulV2Kernel:
             cta_group=tcgen05.CtaGroup.TWO if self.cta_group == 2 else tcgen05.CtaGroup.ONE
         )
         swizzle_128B = cute.make_swizzle(3, 4, 3)
-        # we must put num_stages as the last mode since tma_partition() uses the 1st mode
         s_layout = cute.make_layout((BM, BK, self.num_stages), stride=(BK, 1, BM * BK))
         s_layout = cute.make_composed_layout(swizzle_128B, 0, s_layout)
 
-        one_stage = cute.slice_(s_layout, (None, None, 0))
-        tma_atom, tma_tensor = cpasync.make_tiled_tma_atom(tma_op, A, one_stage, (BM, BK))
+        tma_atom, tma_tensor = cpasync.make_tiled_tma_atom(tma_op, A, s_layout, (BM, BK))
         return tma_atom, tma_tensor, s_layout
 
     @cute.jit
